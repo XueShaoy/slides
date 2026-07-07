@@ -1,0 +1,25 @@
+{
+  "common": {
+    "im_text":          "客服与用户沟通记录",
+    "kf_note":          "客服判断场景",
+    "compare_platform": "比价平台",
+    "q_list_price":     "Q划线价——同质化房型",
+    "q_pay_price":      "Q到手价——同质化房型",
+    "c_list_price":     "划线价（竞品）",
+    "c_pay_price":      "到手价（竞品）",
+    "q_promo_detail":   "Q优惠明细",
+    "c_promo_detail":   "促销明细（竞品）",
+    "case_no":          "case编号",
+    "order_no":         "工单号"
+  },
+  "tongcheng": {
+    "multi_points": "是否多倍积分酒店"
+  },
+  "xiecheng": {
+    "roomid_q":   "同质化房型roomid",
+    "roomid_c":   "CRoomID",
+    "is_fenxiao": "是否分销",
+    "is_louchu":  "是否露出",
+    "lingjuan":   "领用券情况"
+  }
+}

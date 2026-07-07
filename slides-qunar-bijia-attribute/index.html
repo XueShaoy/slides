@@ -22,7 +22,7 @@
   header h1 { font-size: 28px; margin-bottom: 8px; }
   header p { opacity: 0.85; font-size: 14px; }
   .toc {
-    max-width: 900px;
+    max-width: min(1600px, 95vw);
     margin: 24px auto;
     padding: 0 24px;
     display: flex;
@@ -42,7 +42,7 @@
   }
   .toc a:hover { box-shadow: 0 3px 8px rgba(0,0,0,0.15); transform: translateY(-1px); }
   section {
-    max-width: 960px;
+    max-width: min(1600px, 95vw);
     margin: 0 auto 40px;
     background: #fff;
     border-radius: 10px;
@@ -83,6 +83,7 @@
   <a href="#s4">四、价格归因树（同程）</a>
   <a href="#s5">五、完整数据流</a>
   <a href="#s6">六、校验体系</a>
+  <a href="#s7">七、attribute.py 详细工作逻辑</a>
 </nav>
 
 <section id="s1">
@@ -125,7 +126,7 @@ flowchart TD
 
     FALLBACK --> STATE
 
-    subgraph ATTRIBUTION["归因模块 (attribute.py)"]
+    subgraph ATTRIBUTION["归因模块 (attribute.py) 🔗 点击查看详细逻辑"]
         LOAD["加载: 主数据 + 促销数据 + state"]
         L1["一级路由 route_level1() 基于客服判断场景"]
         V3["V3 数据一致性校验: 支付价 vs 一级结论"]
@@ -135,9 +136,17 @@ flowchart TD
         LOAD --> L1 --> V3 --> L234 --> HUMAN --> OUTPUT
     end
 
+    click LOAD "#s7" "查看 attribute.py 详细工作逻辑"
+    click L1 "#s7" "查看 attribute.py 详细工作逻辑"
+    click V3 "#s7" "查看 attribute.py 详细工作逻辑"
+    click L234 "#s7" "查看 attribute.py 详细工作逻辑"
+    click HUMAN "#s7" "查看 attribute.py 详细工作逻辑"
+    click OUTPUT "#s7" "查看 attribute.py 详细工作逻辑"
+
     style INPUT fill:#e1f5fe
     style STATE fill:#fff3e0
     style OUTPUT fill:#e8f5e9
+    style ATTRIBUTION fill:#ede7f6,stroke:#5e35b1,stroke-width:2px
   </div>
 </section>
 
@@ -345,6 +354,166 @@ flowchart TD
     style V2 fill:#e8eaf6
     style V3 fill:#ffcc80
     style V3_FAIL fill:#ffcdd2
+  </div>
+</section>
+
+<section id="s7">
+  <h2>七、attribute.py 详细工作逻辑</h2>
+
+  <h3 style="padding:16px 24px 0;font-size:15px;color:#5e35b1;">7.1 主流程 main() — 数据管道</h3>
+  <div class="mermaid">
+flowchart TD
+    START["启动 main()"]
+    ARGS["解析参数 --output-file / --promo-file / --state-file / --platform / --price-rule-set / --promo-code-set"]
+    STATE_LOAD["load_full_state() 读取 state.json"]
+    PLATFORM["require_platform() 确定平台 携程 / 同程 (缺失或不支持则退出)"]
+    RULESET["normalize_rule_set() 确定 price_rule_set + promo_code_set"]
+    FIELDMAP["load_field_map() 从 shared/field_map.json 合并字段映射 (common + 平台专用)"]
+
+    START --> ARGS --> STATE_LOAD --> PLATFORM --> RULESET --> FIELDMAP --> READ_MAIN
+
+    READ_MAIN["读取主数据 Sheet=主数据 (支付价/划线价列转数值)"]
+    READ_PROMO["读取促销分行表 优先独立促销文件 (Q促销分行表 / 竞品促销分行表) 兜底: 主数据内嵌 sheet"]
+    READ_AUDIT["读取 case_audit = state.agents.promo.case_audit"]
+
+    READ_MAIN --> READ_PROMO --> READ_AUDIT --> LOOP
+
+    LOOP["逐行循环: attribute_row(row, q_df, c_df, rule_set, platform, case_audit)"]
+    LOOP --> COLLECT["收集 归因结果 + _manual_categories + _l3_l4_paths"]
+
+    COLLECT --> WRITE_BACK["写回主数据 sheet: 一级~五级_AI / 归因备注 / 归因平台_AI / rule_set列 / im一级推导 + 人工校验列 (是否需要人工校验 / 人工校验分类 / 5类_详情)"]
+    WRITE_BACK --> COPY_PROMO["_copy_promo_sheets() 复制促销分行表进主数据文件 → 删除独立促销文件"]
+    COPY_PROMO --> SUMMARY["_generate_attribution_summary() 归因结果汇总 (V1~V4 四版本递进, 场景拆分占比)"]
+    SUMMARY --> LOGIC["_generate_attribution_logic() 归因逻辑 (三→四级路径去重 + 归因规则列)"]
+    LOGIC --> STATS["打印 一级/二级/三级_AI 分布 + 人工校验计数"]
+
+    style START fill:#ede7f6
+    style LOOP fill:#bbdefb
+    style WRITE_BACK fill:#c8e6c9
+    style STATS fill:#e8f5e9
+  </div>
+
+  <h3 style="padding:16px 24px 0;font-size:15px;color:#5e35b1;">7.2 单行归因 attribute_row() — 核心决策链</h3>
+  <div class="mermaid">
+flowchart TD
+    ROW["输入: 单行 row + q_df / c_df + case_audit"]
+
+    ROW --> PCHK1{"读取 比价平台 字段 (strip 后) 有值? (即非空 / 非 'nan' / 非 'None')"}
+    PCHK1 -->|"否 · 空值"| L1
+    PCHK1 -->|"是 · 有值"| PCHK2{"该值 ∈ VALID_PLATFORMS {携程, 美团, 飞猪, 同程}?"}
+    PCHK2 -->|"是 · 可比价平台"| L1
+    PCHK2 -->|"否 · 最高优先级命中"| RET_UN["直接返回 (不再走 route_level1) 一级=无法归因 / 二级=不可对比 / 三级=非C平台 归因备注 = '比价平台:' + 原值"]
+
+    L1["route_level1() 解析客服判断场景 优先级: 异常 > 无法归因 > 库存lose > 用户误解 > 价格lose"]
+
+    L1 --> V3{"validate_v3_consistency() 用户误解: Q支付 ≤ 竞品支付? 价格lose: Q支付 > 竞品支付?"}
+    V3 -->|"不一致"| RET_V3["直接返回 一级=校验失败 / 二级=V3错误"]
+    V3 -->|"一致 / 无支付价"| BRANCH
+
+    BRANCH{"按 level1 分派归因函数"}
+    BRANCH -->|"异常"| F_AB["attribute_abnormal()"]
+    BRANCH -->|"无法归因"| F_UN["attribute_unattributable()"]
+    BRANCH -->|"库存lose"| F_INV["attribute_inventory()"]
+    BRANCH -->|"用户误解"| F_MIS["attribute_misconception() 基于 im-归因结果-AI"]
+    BRANCH -->|"价格lose"| F_PRICE{"price_rule_set?"}
+    F_PRICE -->|"xiecheng"| F_XC["attribute_price() 携程价格归因树"]
+    F_PRICE -->|"tongcheng"| F_TC["attribute_price_tongcheng() 同程价格归因树"]
+
+    F_AB --> META
+    F_UN --> META
+    F_INV --> META
+    F_MIS --> META
+    F_XC --> META
+    F_TC --> META
+
+    META["附加元数据: 归因平台_AI / price_rule_set_AI / promo_code_set_AI 合并已有归因备注"]
+    META --> CONFLICT["路由冲突检查: _route_by_im(im结果) 得 im一级推导 若 ≠ level1 → 记 '路由冲突'"]
+    CONFLICT --> FALLBACK["兜底验证累积 manual_reasons: · cs不lose + (错选乱选/未知原因/积分) · 库存lose · im=未知原因+cs不lose+Q含积分"]
+    FALLBACK --> IMTRIG["IM 特殊触发: · 无相同浏览记录 → 模糊场景 · 新发现场景 → 新场景"]
+    IMTRIG --> MERGE_AUDIT["合并促销校验 case_audit (仅 价格lose 保留 V1/V2 促销审计原因)"]
+    MERGE_AUDIT --> CLASSIFY["_classify_reason() 归入 5 类人工校验"]
+    CLASSIFY --> OUT["输出 归因结果 + _manual_categories + _l3_l4_paths"]
+
+    style PCHK1 fill:#ffe0b2
+    style PCHK2 fill:#ffe0b2
+    style RET_UN fill:#ffcdd2
+    style V3 fill:#ffcc80
+    style RET_V3 fill:#ffcdd2
+    style BRANCH fill:#bbdefb
+    style OUT fill:#c8e6c9
+  </div>
+
+  <h3 style="padding:16px 24px 0;font-size:15px;color:#5e35b1;">7.3 各分类归因函数运行原理（价格lose 详见第三节携程 / 第四节同程）</h3>
+  <div class="mermaid">
+flowchart TD
+    DISPATCH{"按 level1 分派"}
+
+    DISPATCH -->|"异常"| AB0
+    subgraph AB["attribute_abnormal() — 依据 客服判断场景(kf)"]
+        AB0{"kf 为空?"}
+        AB0 -->|"是"| AB1["二级=信息缺失 三级=客服分析结果未填写"]
+        AB0 -->|"否 · 有值但前面均未命中"| AB2["二级=未知原因"]
+    end
+
+    DISPATCH -->|"无法归因"| UN0
+    subgraph UN["attribute_unattributable() — kf 关键词"]
+        UN0{"命中哪类关键词?"}
+        UN0 -->|"不可对比平台 / 民宿 / 团购 / 预售 / 已下单"| UN1["二级=不可对比 → 三级: 非C平台 / 民宿房 / 团购房 / 预售 / 已下单"]
+        UN0 -->|"含 'roomid'"| UN2["二级=无法查询到Croomid (CRoomID 为空 → 归因备注='Croomid为空')"]
+    end
+
+    DISPATCH -->|"库存lose"| INV0
+    subgraph INV["attribute_inventory() — kf 关键词"]
+        INV0{"命中哪类关键词?"}
+        INV0 -->|"更好更贵 / 更差更贵"| INV1["二级=同质化房型缺失 三级=更好更贵 / 更差更贵"]
+        INV0 -->|"物理房型"| INV2["二级=物理房型缺失 三级: 物理房型已售罄(已订完/售罄/满房/无房) 物理房型真实缺失(缺失/暂无/无该房型)"]
+        INV0 -->|"酒店缺失 / 无该酒店 / 没有该酒店"| INV3["二级=酒店缺失"]
+    end
+
+    DISPATCH -->|"用户误解"| MIS0
+    subgraph MIS["attribute_misconception() — 解析 im-归因结果-AI 标志位"]
+        MIS0["提取标志: 酒店不一致 / 入离不一致 / 房型不一致 / 同质化权益 / 免费权益 / 积分 / 错选乱选 / 未知原因"]
+        MIS0 --> MIS_L2["二级(可多值组合): 酒店不一致→对比酒店不一致 入离/房型/同质化权益→对比日期/房型/权益等不同 免费权益→免费类权益lose 积分→用户不认可积分优惠 错选乱选/未知/兜底→错选乱选&未知原因"]
+        MIS0 --> MIS_L3["三级(可多值组合): 入离→对比日期不同 酒店→对比酒店不一致 房型→对比房型不同 同质化权益→对比权益不同 (含错选乱选&未知原因时) 错选乱选→错选乱选 / 未知/兜底→未知原因"]
+    end
+
+    DISPATCH -->|"价格lose"| PRICE["attribute_price() 携程 → 第三节 attribute_price_tongcheng() 同程 → 第四节"]
+
+    style DISPATCH fill:#bbdefb
+    style AB fill:#f3e5f5,stroke:#8e24aa
+    style UN fill:#e0f2f1,stroke:#00897b
+    style INV fill:#fff3e0,stroke:#fb8c00
+    style MIS fill:#e8eaf6,stroke:#3949ab
+    style PRICE fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+  </div>
+
+  <h3 style="padding:16px 24px 0;font-size:15px;color:#5e35b1;">7.4 人工校验分类 _classify_reason() — 5 类映射</h3>
+  <div class="mermaid">
+flowchart LR
+    REASON["manual_reason 字符串"]
+
+    REASON -->|"含 '真实错误:V1'"| C1["金额校验"]
+    REASON -->|"含 '真实错误:V2'"| C2["促销匹配"]
+    REASON -->|"含 '字段缺失'"| C3["字段缺失"]
+    REASON -->|"含 '无法确定lose原因'"| C4["归因不完整"]
+    REASON -->|"im=未知原因+cs不lose+Q含积分"| C4
+    REASON -->|"含 '路由冲突'"| C5["归因多重校验"]
+    REASON -->|"'兜底验证' 开头"| C5
+    REASON -->|"'模糊场景' / '新场景' 开头"| C4
+    REASON -->|"其它默认"| C4
+
+    C1 --> FLAG["任一类命中 → 是否需要人工校验=是 人工校验分类=命中类别 各类明细写入 {类别}_详情"]
+    C2 --> FLAG
+    C3 --> FLAG
+    C4 --> FLAG
+    C5 --> FLAG
+
+    style C1 fill:#e8eaf6
+    style C2 fill:#e8eaf6
+    style C3 fill:#e8eaf6
+    style C4 fill:#fff3e0
+    style C5 fill:#fff3e0
+    style FLAG fill:#ffcdd2
   </div>
 </section>
 
